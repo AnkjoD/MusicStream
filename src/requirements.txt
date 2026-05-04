@@ -1,0 +1,12 @@
+pyspark==3.5.0
+apache-airflow-providers-apache-spark
+pandas
+numpy
+scikit-learn
+requests
+streamlit
+plotly
+boto3
+s3fs
+pyarrow
+docker

@@ -1,0 +1,67 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+
+# --- Docker & Project Data ---
+data/
+data/*
+!data/.gitkeep
+containers/airflow/logs/
+containers/airflow/plugins/
+containers/airflow/config/
+*.log
+
+# --- IDEs & Tools ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.agent/
+.ag-kit/
+.temp_ag_kit/
+
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfvars.json
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints
+
+# --- Misc ---
+.history/
+*.bak
+*.tmp

@@ -1,0 +1,52 @@
+# ============================================================
+# Streamlify - Global .dockerignore
+# Mục đích: Giảm Docker build context → Build nhanh hơn
+# ============================================================
+
+# Git & IDE
+.git
+.gitignore
+.vscode
+.idea
+*.md
+
+# Python junk
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+**/.eggs
+
+# Virtual environments
+.venv
+venv
+env
+
+# Data & Logs (KHÔNG bao giờ đưa vào image)
+data/
+**/logs/
+**/*.log
+**/*.parquet
+**/*.csv
+
+# Infrastructure (không liên quan đến app container)
+infrastructure/
+.temp_ag_kit/
+.agent/
+
+# Node/JS (nếu có)
+node_modules/
+**/.next/
+
+# SBT build artifacts (ngoại trừ eventsim JAR đã build)
+eventsim/target/
+eventsim/.bsp/
+eventsim/project/target/
+eventsim/project/project/
+
+# Test files
+**/*test*
+**/*spec*
