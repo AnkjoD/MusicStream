@@ -1,6 +1,11 @@
 from airflow import DAG
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from datetime import datetime, timedelta
+import os
+
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
 # 1. Cấu hình mặc định cho các Task
 default_args = {
@@ -20,6 +25,7 @@ with DAG(
     schedule=None, # Streaming Job chạy liên tục
     start_date=datetime(2024, 1, 1),
     catchup=False,
+    max_active_runs=1,
     tags=['spark', 'streaming', 'kafka', 'minio', 'bronze'],
 ) as dag:
 
@@ -33,23 +39,36 @@ with DAG(
         conf={
             'spark.master': 'spark://spark-master:7077',
             'spark.submit.deployMode': 'client',
-            'spark.executor.memory': '1G',
+            'spark.executor.memory': '512m',
             'spark.executor.cores': '1',
-            'spark.driver.memory': '1G',
+            'spark.cores.max': '1',
+            'spark.driver.memory': '512m',
             'spark.app.name': 'Airflow_Kafka_To_MinIO_Streaming',
             # S3A / MinIO
-            'spark.hadoop.fs.s3a.endpoint': 'http://minio:9000',
-            'spark.hadoop.fs.s3a.access.key': 'homura_madoka',
-            'spark.hadoop.fs.s3a.secret.key': 'homura123',
+            'spark.hadoop.fs.s3a.endpoint': MINIO_ENDPOINT,
+            'spark.hadoop.fs.s3a.access.key': MINIO_ACCESS_KEY,
+            'spark.hadoop.fs.s3a.secret.key': MINIO_SECRET_KEY,
             'spark.hadoop.fs.s3a.path.style.access': 'true',
             'spark.hadoop.fs.s3a.impl': 'org.apache.hadoop.fs.s3a.S3AFileSystem',
             'spark.hadoop.fs.s3a.connection.ssl.enabled': 'false',
             'spark.hadoop.fs.s3a.fast.upload': 'true',
             # Tắt Maven download (JARs đã có sẵn)
             'spark.jars.ivy': '/tmp/.ivy2',
-            # Event log
-            'spark.eventLog.enabled': 'true',
-            'spark.eventLog.dir': 's3a://bronze-zone/spark-events',
+            # Tắt event log (không có bucket spark-events)
+            'spark.eventLog.enabled': 'false',
+            # Dùng FileSystem-based checkpoint — tương thích với S3A (không cần rename atomic)
+            'spark.sql.streaming.checkpointFileManagerClass': 'org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager',
+            # Suppress WARN vô nghĩa: MetricsConfig + NativeCodeLoader + AdminClientConfig
+            'spark.driver.extraJavaOptions': (
+                '-Dlog4j.logger.org.apache.hadoop.metrics2.impl.MetricsConfig=ERROR '
+                '-Dlog4j.logger.org.apache.hadoop.util.NativeCodeLoader=ERROR '
+                '-Dlog4j.logger.org.apache.kafka.clients.admin.AdminClientConfig=ERROR'
+            ),
+            'spark.executor.extraJavaOptions': (
+                '-Dlog4j.logger.org.apache.hadoop.metrics2.impl.MetricsConfig=ERROR '
+                '-Dlog4j.logger.org.apache.hadoop.util.NativeCodeLoader=ERROR '
+                '-Dlog4j.logger.org.apache.kafka.clients.admin.AdminClientConfig=ERROR'
+            ),
         },
         name='spark_kafka_to_minio_job',
         verbose=True,

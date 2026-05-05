@@ -48,12 +48,14 @@ def create_spark() -> SparkSession:
         .config("spark.hadoop.fs.s3a.multipart.size",       "67108864")
         # Streaming
         .config("spark.streaming.stopGracefullyOnShutdown", "true")
-        # AQE
-        .config("spark.sql.adaptive.enabled",                      "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled",   "true")
-        # Parallelism: 3 workers × 2 cores = 6
-        .config("spark.default.parallelism",    "6")
-        .config("spark.sql.shuffle.partitions", "6")
+        # AQE không được hỗ trợ trong Streaming → bỏ hẳn để tránh WARN
+        .config("spark.sql.adaptive.enabled", "false")
+        # Parallelism: 1 worker × 1 core
+        .config("spark.default.parallelism",    "2")
+        .config("spark.sql.shuffle.partitions", "2")
+        # Hardcode giới hạn Core để không bao giờ chiếm tài nguyên của Batch
+        .config("spark.cores.max", "1")
+        .config("spark.executor.cores", "1")
         .getOrCreate()
     )
 
@@ -70,7 +72,7 @@ def main():
         .option("subscribe",               KAFKA_TOPIC)
         .option("startingOffsets",         "earliest")
         .option("failOnDataLoss",          "false")
-        .option("maxOffsetsPerTrigger",    "10000")
+        .option("maxOffsetsPerTrigger",    "2000")
         .load()
     )
 
@@ -85,19 +87,30 @@ def main():
         .filter(col("ts").isNotNull())
     )
 
-    # Ghi vào MinIO Bronze (Parquet, partitioned by page)
+    # Hàm ghi tuỳ chỉnh để có thể in ra console số lượng dòng mỗi phút
+    def process_batch(df, epoch_id):
+        import datetime
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"[{now}] 🚀 [Bronze] Batch {epoch_id} — đang ghi vào MinIO...")
+        # Ghi trực tiếp — không dùng df.count() tránh kích hoạt KafkaReader lần 2
+        df.write \
+            .format("parquet") \
+            .mode("append") \
+            .partitionBy("page") \
+            .save("s3a://bronze-zone/datalake/raw/eventsim")
+        print(f"[{now}] ✅ [Bronze] Batch {epoch_id} đã lưu vào MinIO!")
+
+
+    # Ghi vào MinIO Bronze (thông qua process_batch)
     query_minio = (
         parsed_df.writeStream
-        .format("parquet")
-        .option("path",               "s3a://bronze-zone/datalake/raw/eventsim")
+        .foreachBatch(process_batch)
         .option("checkpointLocation", "s3a://bronze-zone/datalake/checkpoints/eventsim_raw")
-        .partitionBy("page")
-        .outputMode("append")
-        .trigger(processingTime="30 seconds")
+        .trigger(processingTime="60 seconds")
         .start()
     )
 
-    print(f"✅ [Streaming] Kafka→MinIO pipeline đang chạy...")
+    print(f"✅ [Streaming] Kafka→MinIO pipeline đang chạy và sẽ báo cáo mỗi 60s...")
     print(f"   Kafka: {KAFKA_BROKER} | Topic: {KAFKA_TOPIC}")
     print(f"   MinIO: {MINIO_ENDPOINT} | Bucket: bronze-zone")
     query_minio.awaitTermination()

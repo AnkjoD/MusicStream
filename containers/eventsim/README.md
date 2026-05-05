@@ -22,16 +22,15 @@ weekends and holidays.
 To make this work, I did the following:
 
 * If you set the "damping" factors to zero, then users randomly arrive at the site according to a Poisson (memoryless)
-process, but with a minimum gap of 30 minutes between sessions.
+  process, but with a minimum gap of 30 minutes between sessions.
 * The time between events is given by a log-normal distribution
 * Once a sessions has started, the user will randomly traverse a set of states until the session ends. The probability
-of each state transition (including end of session) depends on the current state.
+  of each state transition (including end of session) depends on the current state.
 * On average, users will behave the same way in a session, regardless of the time of day or day of week
 * If you enable damping for weekends and holidays, the probability that a user arrives on weekends and holidays drops.
-The odds are scaled linearly over a course of a few hours (by default) around midnight (by default).
+  The odds are scaled linearly over a course of a few hours (by default) around midnight (by default).
 * If you enable damping for nighttime, the probability that a user arrives in the middle of the night is lower than
-the probability that they arrive in the middle of the day. The odds roughly follow a sine wave.
-
+  the probability that they arrive in the middle of the day. The odds roughly follow a sine wave.
 
 How the simulation works
 ========================
@@ -68,15 +67,16 @@ other types of sites, but doing so will probably require modifications to the co
 
 Config File
 ===========
+
 Take a look at the sample config file. It's a JSON file, with key-value pairs.  Here is an explanation of the values
 (many of which match command line options):
 
 * `seed` For the pseudo-random number generator. Changing this value will change the output (all other parameters
-being equal).
+  being equal).
 * `alpha` This is the expected number of seconds between events for a user. This is randomly generated from a lognormal
-distrbution
+  distrbution
 * `beta` This is the expected session interarrival time (in seconds). This is thirty minutes plus a randomly selected
-value from an exponential distribution
+  value from an exponential distribution
 * `damping` Controls the depth of daily cycles (larger values yield stronger cycles, smaller yield milder)
 * `weekend-damping` Controls the difference between weekday and weekend traffic volume
 * `weekend-damping-offset` Controls when the weekend/holiday starts (relative to midnight), in minutes
@@ -94,15 +94,14 @@ authentication status. Status should be used to describe a user's status: unregi
 cancelled, etc. Pages are used to describe a user's page. Here is how you specify the state machine:
 
 * Transitions. Describe the pair of page and status before and after each transition, and the
-probability of the transition.
+  probability of the transition.
 * New user. Describes the page and status for each new user (and probability of arriving for the
-first time with one of those states).
+  first time with one of those states).
 * New session. Describes that page and status for each new session.
 * Show user details. For each status, states whether or not users are shown in the generated event log.
 
 When you run the simulator, you specify the mean values for alpha and beta and the simulator picks values for specific
 users.
-
 
 Usage
 =====
@@ -118,33 +117,33 @@ To build the executable, run
 The program can accept a number of command line options:
 
     $ bin/eventsim --help
-        -a, --attrition-rate  <arg>    annual user attrition rate (as a fraction of
+        -a, --attrition-rate`<arg>`    annual user attrition rate (as a fraction of
                                        current, so 1% => 0.01) (default = 0.0)
-        -c, --config  <arg>            config file
+        -c, --config  `<arg>`            config file
             --continuous               continuous output
             --nocontinuous             run all at once
-        -e, --end-time  <arg>          end time for data
+        -e, --end-time  `<arg>`          end time for data
                                        (default = 2015-08-12T14:56:25.006)
-        -f, --from  <arg>              from x days ago (default = 15)
+        -f, --from  `<arg>`              from x days ago (default = 15)
             --generate-counts          generate listen counts file then stop
             --nogenerate-counts        run normally
             --generate-similars        generate similar song file then stop
             --nogenerate-similars      run normally
-        -g, --growth-rate  <arg>       annual user growth rate (as a fraction of
+        -g, --growth-rate  `<arg>`       annual user growth rate (as a fraction of
                                        current, so 1% => 0.01) (default = 0.0)
-            --kafkaBrokerList  <arg>   kafka broker list
-        -k, --kafkaTopic  <arg>        kafka topic
-        -n, --nusers  <arg>            initial number of users (default = 1)
-        -r, --randomseed  <arg>        random seed
-        -s, --start-time  <arg>        start time for data
+            --kafkaBrokerList  `<arg>`   kafka broker list
+        -k, --kafkaTopic  `<arg>`        kafka topic
+        -n, --nusers  `<arg>`            initial number of users (default = 1)
+        -r, --randomseed  `<arg>`        random seed
+        -s, --start-time  `<arg>`        start time for data
                                        (default = 2015-08-05T14:56:25.040)
-            --tag  <arg>               tag applied to each line (for example, A/B test
+            --tag  `<arg>`               tag applied to each line (for example, A/B test
                                        group)
-        -t, --to  <arg>                to y days ago (default = 1)
-        -u, --userid  <arg>            first user id (default = 1)
+        -t, --to  `<arg>`                to y days ago (default = 1)
+        -u, --userid  `<arg>`            first user id (default = 1)
             --help                     Show help message
 
-       trailing arguments:
+    trailing arguments:
         output-file (not required)   File name
 
 Only the config file is required.
@@ -167,16 +166,17 @@ Example for more events (30,000 users for a year, growing at 30% annually):
 
 Building huge data sets in parallel
 ===================================
+
 You can run multiple instances of this application simultaneously if you need to generate a lot of data very quickly.
 To do this, we recommend the following strategy:
 
 * Use a different random seed for each instance. This assures that each instance will produce different data.
 * Use a different starting user id for each instance (and make sure the ranges don't overlap). This assures that each
-instance will produce data with different user ids.
+  instance will produce data with different user ids.
 * Create a set of configuration files, one for each instance of eventsim. This will help you re-create your data,
-and help you remember the details of the data
+  and help you remember the details of the data
 * Do not generate data for different time periods. The generator doesn't generate full sessions if they cross the start
-and end dates; you will find some incomplete data between files.
+  and end dates; you will find some incomplete data between files.
 
 A Cool Example
 ==============
@@ -185,29 +185,29 @@ To simulate A/B tests, create multiple data sets for the same time period with d
 tags, and different  parameters for alpha, beta, transition probabilities, or growth rates. For example, you can
 geneate two files of about 5000 users with different characteristics with two commands like this:
 
-        $ bin/eventsim --config examples/example-config.json --tag control -n 5000 \
-        --start-time "2015-06-01T00:00:00" --end-time "2015-09-01T00:00:00" \
-        --growth-rate 0.25 --userid 1 --randomseed 1 control.data.json
+    $ bin/eventsim --config examples/example-config.json --tag control -n 5000
+    --start-time "2015-06-01T00:00:00" --end-time "2015-09-01T00:00:00"
+    --growth-rate 0.25 --userid 1 --randomseed 1 control.data.json
         Loading song file...
         385000	...done loading song file. 385252 tracks loaded.
         Loading similar song file...
         Could not load similar song file (don't worry if it's missing)
 
-        Initial number of users: 5000, Final number of users: 5335
+    Initial number of users: 5000, Final number of users: 5335
         Start: 2015-06-01T00:00, End: 2015-09-01T00:00
         Starting to generate events.
         Damping=0.09375, Weekend-Damping=0.5
         Now: 2015-08-31T15:38:02, Events:1430000, Rate: 147058 eps
 
-        $bin/eventsim --config examples/alt-example-config.json --tag test -n 5000 \
-        > --start-time "2015-06-01T00:00:00" --end-time "2015-09-01T00:00:00" \
-        > --growth-rate 0.25 --userid 5336 --randomseed 2 test.data.json
+    $bin/eventsim --config examples/alt-example-config.json --tag test -n 5000
+    > --start-time "2015-06-01T00:00:00" --end-time "2015-09-01T00:00:00"
+    > --growth-rate 0.25 --userid 5336 --randomseed 2 test.data.json
         Loading song file...
         385000	...done loading song file. 385252 tracks loaded.
         Loading similar song file...
         Could not load similar song file (don't worry if it's missing)
 
-        Initial number of users: 5000, Final number of users: 5352
+    Initial number of users: 5000, Final number of users: 5352
         Start: 2015-06-01T00:00, End: 2015-09-01T00:00
         Starting to generate events.
         Damping=0.09425, Weekend-Damping=0.53
@@ -219,15 +219,16 @@ Issues and Future Work
 Want to pitch in and help? Here are some ideas on ways to make this better?
 
 * We haven't made the generator multi-threaded yet, but there isn't a good reason that we can't do that. (The only
-state that needs to be shared between threads is the priority queue, and access to that can be easily controlled).
+  state that needs to be shared between threads is the priority queue, and access to that can be easily controlled).
 * The models to generate data could also use more work. We made some rough guesses based on experience, but aren't
-sure how well they reflect reality. (In particular, the sine curve for cycles bugs me.)
+  sure how well they reflect reality. (In particular, the sine curve for cycles bugs me.)
 * The simulator is tied closely to simulating a web site, specifically a music web site. It would be great to make
-the simulation more abstract, so that different configuration files could be used for dramatically different use cases.
+  the simulation more abstract, so that different configuration files could be used for dramatically different use cases.
 * This is written by a novice Scala programmer. An expert could improve the code quality.
 
 License
 =======
+
 We have adopted the MIT license (see the file LICENSE.txt) for this project.
 
 About the source data

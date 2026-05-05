@@ -10,11 +10,16 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: "6"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     AIRFLOW__SCHEDULER__STATSD_ON: "false"
     AIRFLOW_UID: ${AIRFLOW_UID}
     _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
     _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    MINIO_ENDPOINT: "http://minio:9000"
   volumes:
     - ${AIRFLOW_DAGS_PATH}:/opt/airflow/dags
     - ${AIRFLOW_LOGS_PATH}:/opt/airflow/logs
@@ -101,11 +106,11 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: streamlify-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-      KAFKA_CLUSTERS_0_METRICS_PORT: 9997
     depends_on:
       - kafka
     networks:
       - bigdata-network
+    mem_limit: 256m
     restart: always
 
   airflow-webserver:
@@ -119,14 +124,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    mem_limit: 512m
     restart: always
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      airflow-init:
-        condition: service_completed_successfully
 
   airflow-scheduler:
     <<: *airflow-common
@@ -139,6 +138,7 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+    mem_limit: 256m
     restart: always
 
   airflow-worker:
@@ -155,6 +155,7 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+    mem_limit: 6g
     restart: always
 
   airflow-init:
@@ -197,6 +198,8 @@ services:
       - bigdata-network
     restart: always
 
+  # ── CHỈ GIỮ 1 SPARK WORKER để tiết kiệm RAM trên máy dev ──
+  # Mở thêm worker khi cần: docker compose up -d spark-worker-2
   spark-worker-1:
     build:
       context: ..
@@ -206,7 +209,7 @@ services:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-512m}
       SPARK_WORKER_WEBUI_PORT: 8081
     volumes:
       - ../src:/data
@@ -215,68 +218,14 @@ services:
       - bigdata-network
     depends_on:
       - spark-master
+    mem_limit: 5g
     restart: always
 
-  spark-worker-2:
-    build:
-      context: ..
-      dockerfile: containers/spark/Dockerfile
-    container_name: spark-worker-2
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
-      SPARK_WORKER_WEBUI_PORT: 8083
-    volumes:
-      - ../src:/data
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    networks:
-      - bigdata-network
-    depends_on:
-      - spark-master
-    restart: always
-
-  # Worker thứ 3 - Fully Distributed (3 nodes)
-  spark-worker-3:
-    build:
-      context: ..
-      dockerfile: containers/spark/Dockerfile
-    container_name: spark-worker-3
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2G}
-      SPARK_WORKER_WEBUI_PORT: 8084
-    volumes:
-      - ../src:/data
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    networks:
-      - bigdata-network
-    depends_on:
-      - spark-master
-    restart: always
-
-  # Spark History Server - Xem lịch sử jobs sau khi chạy xong
-  spark-history-server:
-    build:
-      context: ..
-      dockerfile: containers/spark/Dockerfile
-    container_name: spark-history-server
-    ports:
-      - "18080:18080"
-    environment:
-      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=s3a://bronze-zone/spark-events -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000 -Dspark.hadoop.fs.s3a.access.key=homura_madoka -Dspark.hadoop.fs.s3a.secret.key=homura123 -Dspark.hadoop.fs.s3a.path.style.access=true -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
-    networks:
-      - bigdata-network
-    depends_on:
-      - spark-master
-    restart: always
+  # spark-worker-2 và spark-worker-3 đã tắt để tiết kiệm RAM
+  # Mở lại bằng: docker compose up -d spark-worker-2 spark-worker-3
 
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: minio/minio:latest
     container_name: minio
     ports:
       - "${MINIO_API_PORT}:9000"
@@ -292,6 +241,7 @@ services:
     command: server /data{1...4} --console-address ":9001"
     networks:
       - bigdata-network
+    mem_limit: 512m
     restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
@@ -313,7 +263,7 @@ services:
     volumes:
       - ../src:/app/src
       - /var/run/docker.sock:/var/run/docker.sock
-    command:
+    entrypoint:
       [
         "streamlit",
         "run",
@@ -343,6 +293,7 @@ services:
       - GROWTH_RATE=0.0
       - EVENT_DELAY_MS=200
       - REAL_TIME=true
+    mem_limit: 128m
     restart: on-failure
 
 networks:

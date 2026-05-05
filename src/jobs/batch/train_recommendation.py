@@ -1,9 +1,8 @@
 from pyspark.sql import SparkSession
 from pyspark.ml.recommendation import ALS
-from pyspark.ml.feature import StringIndexer
-from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.sql.functions import col, count
+from pyspark.sql.functions import col, count, abs as spark_abs, hash as spark_hash
+from pyspark.sql.utils import AnalysisException
 import os
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
@@ -28,6 +27,8 @@ def main():
         # Kryo serializer: nhanh hơn Java default serializer
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.kryoserializer.buffer.max", "512m")
+        # Suppress WARN SparkStringUtils: plan truncated
+        .config("spark.sql.debug.maxToStringFields", "50")
         .getOrCreate()
     )
 
@@ -43,10 +44,6 @@ def main():
     try:
         df = spark.read.parquet(silver_path)
 
-        if df.rdd.isEmpty():
-            print("⚠️  Không có dữ liệu để train.")
-            return
-
         # ── Tính implicit rating: số lần user nghe bài ──
         # Chạy distributed GroupBy trên tất cả Executors
         rating_df = df \
@@ -54,20 +51,25 @@ def main():
             .groupBy("userId", "song") \
             .agg(count("*").alias("play_count"))
 
-        # ── String → Integer index (cho ALS) ──
-        user_indexer = StringIndexer(
-            inputCol="userId", outputCol="user_idx", handleInvalid="skip"
+        # ── Hash-based Integer Index (thay thế StringIndexer) ──
+        # StringIndexer cần collect() TẤT CẢ unique values → EOFException khi data lớn
+        # Hash-based: 100% distributed, không collect() gì cả
+        user_mapping = rating_df.select(
+            (spark_abs(spark_hash(col("userId"))) % 100000).cast("int").alias("user_idx"),
+            "userId"
+        ).dropDuplicates(["user_idx"])
+
+        song_mapping = rating_df.select(
+            (spark_abs(spark_hash(col("song"))) % 100000).cast("int").alias("song_idx"),
+            "song"
+        ).dropDuplicates(["song_idx"])
+
+        model_data = rating_df.select(
+            (spark_abs(spark_hash(col("userId"))) % 100000).cast("int").alias("user_idx"),
+            (spark_abs(spark_hash(col("song")))   % 100000).cast("int").alias("song_idx"),
+            col("play_count").cast("float")
         )
-        song_indexer = StringIndexer(
-            inputCol="song", outputCol="song_idx", handleInvalid="skip"
-        )
-        prep_pipeline = Pipeline(stages=[user_indexer, song_indexer])
-        model_data = prep_pipeline.fit(rating_df).transform(rating_df) \
-            .select(
-                col("user_idx").cast("int"),
-                col("song_idx").cast("int"),
-                col("play_count").cast("float")
-            )
+
 
         # ── ALS: Matrix Factorization - Fully Distributed ──
         # ALS chia user matrix và item matrix ra các Executors
@@ -75,14 +77,12 @@ def main():
         als = ALS(
             maxIter=10,
             regParam=0.1,
-            rank=10,                    # Số latent factors
+            rank=10,
             userCol="user_idx",
             itemCol="song_idx",
             ratingCol="play_count",
-            coldStartStrategy="drop",   # Bỏ user/song chưa có trong training
+            coldStartStrategy="drop",
             nonnegative=True,
-            numUserBlocks=-1,           # -1 = auto-detect số blocks tối ưu
-            numItemBlocks=-1,
         )
 
         train_df, test_df = model_data.randomSplit([0.8, 0.2], seed=42)
@@ -102,12 +102,19 @@ def main():
         print(f"💾 [ALS] Lưu gợi ý vào: {gold_path}")
         recommendations = model.recommendForAllUsers(10)
         recommendations.write.mode("overwrite").parquet(gold_path)
+        
+        # Lưu mapping để Dashboard dịch ngược ID ra tên thật
+        user_mapping.write.mode("overwrite").parquet("s3a://gold-zone/datalake/gold/user_mapping")
+        song_mapping.write.mode("overwrite").parquet("s3a://gold-zone/datalake/gold/song_mapping")
 
         # Lưu model để inference
         model.write().overwrite().save(model_path)
 
         print(f"✅ [ALS] Training hoàn tất! RMSE={rmse:.4f}")
 
+    except AnalysisException as e:
+        print(f"⚠️  Silver layer chưa có dữ liệu. Chờ Bronze→Silver chạy xong trước. ({e})")
+        return
     except Exception as e:
         print(f"❌ Lỗi: {e}")
         raise

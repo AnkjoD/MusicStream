@@ -1,5 +1,6 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, count
+from pyspark.sql.utils import AnalysisException
 import os
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
@@ -27,7 +28,7 @@ def main():
     gold_path   = "s3a://gold-zone/datalake/gold/song_rankings"
 
     try:
-        silver_df = spark.read.parquet(silver_path)
+        silver_df = spark.read.option("recursiveFileLookup", "true").parquet(silver_path)
 
         # ── Aggregation chạy hoàn toàn distributed ──
         # Spark tự chia data giữa các Executors, mỗi Executor tính partial count
@@ -37,16 +38,21 @@ def main():
             .groupBy("artist", "song") \
             .agg(count("*").alias("play_count")) \
             .orderBy(col("play_count").desc())
+            
+        print(f"⏳ [Gold] Đang tổng hợp Bảng Xếp Hạng vào {gold_path} (Tốc độ tối đa)...")
 
         # Ghi toàn bộ kết quả distributed (không dùng .show() trong production)
         song_rankings.write.mode("overwrite").parquet(gold_path)
-        print(f"✅ [Silver→Gold] Song rankings đã được cập nhật tại: {gold_path}")
+        print(f"✅ [Gold] Chúc mừng! Đã hoàn tất ghi Bảng xếp hạng vào Gold Layer.")
 
         # Log top 10 nhẹ nhàng (lấy 10 dòng thôi)
         top10 = song_rankings.limit(10).collect()
         for i, row in enumerate(top10, 1):
             print(f"   #{i}: {row['artist']} - {row['song']} ({row['play_count']} plays)")
 
+    except AnalysisException as e:
+        print(f"⚠️  Silver layer chưa có dữ liệu. Chờ Bronze→Silver chạy xong trước. ({e})")
+        return
     except Exception as e:
         print(f"❌ Lỗi: {e}")
         raise

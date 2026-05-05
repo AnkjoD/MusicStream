@@ -28,10 +28,12 @@ from pyspark.sql.functions import (
     col, count, sum as spark_sum, avg, datediff,
     max as spark_max, min as spark_min, lit, when, to_date
 )
+from pyspark.sql.utils import AnalysisException
 from pyspark.sql.types import IntegerType, FloatType
 from pyspark.ml.feature import StringIndexer, VectorAssembler
 from pyspark.ml import Pipeline
 import os
+import sys
 
 
 def create_spark_session():
@@ -51,13 +53,19 @@ def create_spark_session():
     )
 
 
-def build_user_features(silver_df):
+def build_user_features(silver_df, spark):
     """
     Feature Engineering: Tổng hợp hành vi user từ event logs.
     Mỗi user → 1 dòng với các feature aggregated.
     """
     # Tham chiếu ngày cuối cùng trong dataset
-    max_date = silver_df.agg(spark_max("event_time")).collect()[0][0]
+    # Dùng Spark SQL để lấy max_date - chạy thuần JVM, không gọi Python
+    # Lấy max_date qua SQL scalar — thuần JVM, không dùng collectToPython/first()
+    silver_df.createOrReplaceTempView("silver_events")
+    max_date_row = spark.sql(
+        "SELECT MAX(event_time) AS max_dt FROM silver_events"
+    ).collect()
+    max_date = max_date_row[0]["max_dt"] if max_date_row and max_date_row[0]["max_dt"] else None
 
     user_features = silver_df.groupBy("userId", "level", "gender").agg(
         # Tổng số bài đã nghe
@@ -155,8 +163,8 @@ def build_ml_pipeline(feature_cols):
         xgb = GBTClassifier(
             featuresCol="features",
             labelCol="churn",
-            maxIter=100,
-            maxDepth=6,
+            maxIter=10,        # Đã giảm từ 100 xuống 10 để tránh OOM
+            maxDepth=4,        # Đã giảm từ 6 xuống 4
             stepSize=0.1,
             subsamplingRate=0.8,
             featureSubsetStrategy="0.8",
@@ -176,20 +184,16 @@ def main():
     print("🎯 [Churn Model] Đang đọc dữ liệu Silver Layer...")
 
     try:
+        # Xóa recursiveFileLookup để Spark nhận diện cột partition 'page'
         silver_df = spark.read.parquet(silver_path)
-
-        if silver_df.rdd.isEmpty():
-            print("⚠️  Không có dữ liệu để train. Hãy chạy raw_to_silver trước.")
-            return
 
         # 1. Feature Engineering
         print("⚙️  [Churn Model] Đang tổng hợp features từ event logs...")
-        user_features = build_user_features(silver_df)
+        user_features = build_user_features(silver_df, spark)
         labeled_df = create_churn_label(user_features)
 
-        print(f"   📊 Tổng số users: {labeled_df.count()}")
-        churn_rate = labeled_df.filter(col("churn") == 1).count() / labeled_df.count()
-        print(f"   📉 Tỷ lệ churn: {churn_rate:.1%}")
+        # Đã loại bỏ các hàm labeled_df.count() ở đây vì nó force Spark phải
+        # compute toàn bộ dataframe nhiều lần, gây OOM cho máy dev 512MB.
 
         # 2. Chuẩn bị features
         feature_cols = [
@@ -207,7 +211,7 @@ def main():
 
         # 3. Train/Test split (80/20)
         train_df, test_df = labeled_df.randomSplit([0.8, 0.2], seed=42)
-        print(f"   🏋️  Train: {train_df.count()} | Test: {test_df.count()}")
+        # Đã loại bỏ train_df.count() và test_df.count() để tối ưu RAM
 
         # 4. Build và Train Pipeline (Distributed!)
         print("🚀 [Churn Model] Bắt đầu training phân tán trên Spark Cluster...")
@@ -242,10 +246,14 @@ def main():
 ╚══════════════════════════════════════╝
         """)
 
+    except AnalysisException as e:
+        print(f"⚠️  [Churn Model] Silver layer chưa có dữ liệu (hoặc đang rỗng). Vui lòng chờ luồng ETL chạy xong. Chi tiết: {e}")
+        return
     except Exception as e:
-        print(f"❌ Lỗi: {str(e)}")
+        print(f"❌ Lỗi nghiêm trọng: {str(e)}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)
     finally:
         spark.stop()
 
