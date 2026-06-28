@@ -6,8 +6,8 @@ from pyspark.sql.utils import AnalysisException
 import os
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "homura_madoka")
-MINIO_SECRET   = os.getenv("MINIO_SECRET_KEY", "homura123")
+MINIO_ACCESS   = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET   = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
 
 def main():
@@ -21,20 +21,20 @@ def main():
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        # ALS cần nhiều memory cho matrix factorization
+        # ALS cần kha khá RAM cho việc phân rã ma trận (matrix factorization)
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.shuffle.partitions", "6")
-        # Kryo serializer: nhanh hơn Java default serializer
+        # Dùng Kryo serializer để tuần tự hóa dữ liệu nhanh hơn hẳn so với serializer mặc định của Java
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.kryoserializer.buffer.max", "512m")
-        # Suppress WARN SparkStringUtils: plan truncated
+        # Giới hạn in log string tránh làm trôi màn hình console
         .config("spark.sql.debug.maxToStringFields", "50")
         .getOrCreate()
     )
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # ── Paths: ĐÃ SỬA từ HDFS sang MinIO ──
+    # ── Định nghĩa các đường dẫn lưu trữ trên MinIO ──
     silver_path = "s3a://silver-zone/datalake/silver/eventsim"
     gold_path   = "s3a://gold-zone/datalake/gold/recommendations"
     model_path  = "s3a://gold-zone/models/als_recommendation"
@@ -44,16 +44,16 @@ def main():
     try:
         df = spark.read.parquet(silver_path)
 
-        # ── Tính implicit rating: số lần user nghe bài ──
-        # Chạy distributed GroupBy trên tất cả Executors
+        # ── Tính rating ngầm (implicit): User nghe bài hát bao nhiêu lần thì coi như thích bấy nhiêu ──
+        # Gom nhóm phân tán trên toàn bộ các Executor
         rating_df = df \
             .filter(col("userId").isNotNull() & col("song").isNotNull()) \
             .groupBy("userId", "song") \
             .agg(count("*").alias("play_count"))
 
-        # ── Hash-based Integer Index (thay thế StringIndexer) ──
-        # StringIndexer cần collect() TẤT CẢ unique values → EOFException khi data lớn
-        # Hash-based: 100% distributed, không collect() gì cả
+        # ── Dùng hàm Hash để tự sinh ID số nguyên thay cho StringIndexer ──
+        # StringIndexer của Spark bắt buộc phải gom (collect) toàn bộ giá trị về máy Driver để gán nhãn, dễ gây tràn RAM/lỗi EOF.
+        # Dùng hash thì tự tính toán song song hoàn toàn ngay trên các Worker, không cần gom về Driver.
         user_mapping = rating_df.select(
             (spark_abs(spark_hash(col("userId"))) % 100000).cast("int").alias("user_idx"),
             "userId"
@@ -71,9 +71,9 @@ def main():
         )
 
 
-        # ── ALS: Matrix Factorization - Fully Distributed ──
-        # ALS chia user matrix và item matrix ra các Executors
-        # Mỗi Executor giữ một "block" của ma trận → không cần 1 máy chứa hết
+        # ── Thuật toán ALS: Phân rã ma trận phân tán ──
+        # Spark sẽ tự xé nhỏ ma trận User và ma trận Song ra các Executor để xử lý độc lập.
+        # Nhờ vậy không có máy nào phải chứa toàn bộ ma trận khổng lồ.
         als = ALS(
             maxIter=10,
             regParam=0.1,
@@ -98,16 +98,16 @@ def main():
         rmse = evaluator.evaluate(predictions)
         print(f"   📈 RMSE: {rmse:.4f}")
 
-        # Top 10 gợi ý cho tất cả users - distributed map operation
+        # Gợi ý Top 10 bài hát cho toàn bộ danh sách user (hoạt động map phân tán)
         print(f"💾 [ALS] Lưu gợi ý vào: {gold_path}")
         recommendations = model.recommendForAllUsers(10)
         recommendations.write.mode("overwrite").parquet(gold_path)
         
-        # Lưu mapping để Dashboard dịch ngược ID ra tên thật
+        # Lưu lại bảng mapping ID để Dashboard Streamlit sau này dịch ngược ID số thành tên người dùng và bài hát thật
         user_mapping.write.mode("overwrite").parquet("s3a://gold-zone/datalake/gold/user_mapping")
         song_mapping.write.mode("overwrite").parquet("s3a://gold-zone/datalake/gold/song_mapping")
 
-        # Lưu model để inference
+        # Export model đã train để phục vụ đợt gợi ý tiếp theo
         model.write().overwrite().save(model_path)
 
         print(f"✅ [ALS] Training hoàn tất! RMSE={rmse:.4f}")

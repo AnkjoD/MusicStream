@@ -1,26 +1,23 @@
 """
-Churn Prediction với XGBoost Distributed trên Spark Cluster
-============================================================
+Xây dựng mô hình dự đoán Churn sử dụng XGBoost phân tán trên Spark.
 
-MÔ HÌNH NÀY LÀM GÌ?
-    XGBoost dự đoán user nào có nguy cơ "downgrade" từ PAID → FREE
-    (tức là "churn" - rời bỏ gói Premium)
+Nhiệm vụ của mô hình:
+    Dự đoán xem người dùng nào đang xài gói trả phí (PAID) có xu hướng hạ cấp xuống gói miễn phí (FREE)
+    để mình kịp thời tung ra các chương trình khuyến mãi/ưu đãi giữ chân họ.
 
-    Input features (từ Silver Layer):
-        - Số lần nghe nhạc trong 7 ngày
-        - Tỷ lệ nghe hoàn thành bài (vs skip)
-        - Số session trung bình mỗi ngày
-        - Tỷ lệ dùng Thumbs Down
-        - Số lần xem trang Settings / Help
-        - Giới tính, OS, Browser
-    
-    Output: Xác suất churn (0-1), lưu vào Gold Layer
-    Use case thực tế: Gửi ưu đãi cho user sắp rời đi
+    Các đặc trưng (Features) đầu vào gom từ tầng Silver:
+        - Tần suất nghe nhạc (tổng số bài hát đã nghe).
+        - Mức độ hài lòng (tỷ lệ Thumbs Up / Thumbs Down).
+        - Tần suất truy cập trang cấu hình Settings/Help (dấu hiệu muốn hủy gói).
+        - Hoạt động tương tác (số session, số ngày active, tần suất truy cập trung bình).
+        - Thông tin cơ bản: Giới tính, OS, Browser đang dùng.
 
-FULLY DISTRIBUTED VỚI SPARKXGB:
-    - Sử dụng xgboost4j-spark (native Spark distribution)
-    - Dữ liệu được chia đều giữa các Spark Workers
-    - Training song song thực sự, không bottleneck ở Driver
+    Đầu ra (Output):
+        - Xác suất người dùng đó sẽ churn (từ 0 đến 1), ghi thẳng vào Gold Layer.
+
+Cơ chế phân tán với SparkXGB:
+    - Train mô hình trực tiếp trên Spark Cluster qua thư viện xgboost4j-spark.
+    - Dữ liệu được xé nhỏ ra các Worker để train song song, Driver chỉ nhận kết quả cuối, tránh nghẽn cổ chai.
 """
 
 from pyspark.sql import SparkSession
@@ -37,17 +34,17 @@ import sys
 
 
 def create_spark_session():
-    """Tạo SparkSession với cấu hình tối ưu cho Distributed ML."""
+    """Khởi động SparkSession, cấu hình tối ưu nhất cho việc chạy học máy phân tán."""
     return (
         SparkSession.builder
         .appName("ChurnPrediction_XGBoost_Distributed")
         .config("spark.hadoop.fs.s3a.endpoint", os.getenv("MINIO_ENDPOINT", "http://minio:9000"))
-        .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ACCESS_KEY", "homura_madoka"))
-        .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_SECRET_KEY", "homura123"))
+        .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ACCESS_KEY", "minioadmin"))
+        .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_SECRET_KEY", "minioadmin"))
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        # Tối ưu cho distributed training
+        # Chia đều dữ liệu thành 200 partition để Spark xử lý song song mượt mà hơn
         .config("spark.sql.shuffle.partitions", "200")
         .getOrCreate()
     )
@@ -55,47 +52,49 @@ def create_spark_session():
 
 def build_user_features(silver_df, spark):
     """
-    Feature Engineering: Tổng hợp hành vi user từ event logs.
-    Mỗi user → 1 dòng với các feature aggregated.
+    Gom các event log lại theo từng user để tạo tính năng (feature engineering).
+    Mỗi user sẽ được tổng hợp thành đúng 1 dòng dữ liệu chứa toàn bộ hành vi của họ.
     """
-    # Tham chiếu ngày cuối cùng trong dataset
-    # Dùng Spark SQL để lấy max_date - chạy thuần JVM, không gọi Python
-    # Lấy max_date qua SQL scalar — thuần JVM, không dùng collectToPython/first()
+    # Lấy ngày cuối cùng có dữ liệu trong dataset để làm mốc tính thời gian active.
+    # Dùng câu lệnh SQL của Spark chạy trực tiếp dưới JVM cho nhanh, tránh gọi đi gọi lại qua Python Driver.
     silver_df.createOrReplaceTempView("silver_events")
     max_date_row = spark.sql(
         "SELECT MAX(event_time) AS max_dt FROM silver_events"
     ).collect()
     max_date = max_date_row[0]["max_dt"] if max_date_row and max_date_row[0]["max_dt"] else None
 
+    # Bắt đầu gom nhóm và tính toán các chỉ số hành vi
     user_features = silver_df.groupBy("userId", "level", "gender").agg(
-        # Tổng số bài đã nghe
+        # Đếm tổng số bài hát đã nghe hoàn chỉnh
         count(when(col("page") == "NextSong", True)).alias("total_songs"),
-        # Số lần "Thumbs Down" (bài không thích)
+        # Đếm số lần bấm Thumbs Down (thể hiện không thích bài hát)
         count(when(col("page") == "Thumbs Down", True)).alias("thumbs_down"),
-        # Số lần "Thumbs Up"
+        # Đếm số lần bấm Thumbs Up (yêu thích bài hát)
         count(when(col("page") == "Thumbs Up", True)).alias("thumbs_up"),
-        # Số lần vào trang Settings (dấu hiệu muốn hủy)
+        # Số lần truy cập trang Settings (đang phân vân cấu hình hoặc tìm nút hủy gói)
         count(when(col("page") == "Settings", True)).alias("settings_visits"),
-        # Số lần vào trang Help
+        # Số lần mò vào trang trợ giúp Help
         count(when(col("page") == "Help", True)).alias("help_visits"),
-        # Số lần vào trang Cancel (tín hiệu churn mạnh nhất)
+        # Sự kiện bấm Downgrade (đây là tín hiệu Churn rõ nhất của bộ giả lập eventsim)
+        count(when(col("page") == "Downgrade", True)).alias("downgrade_count"),
+        # Đếm thêm sự kiện Cancel thật phòng khi cấu trúc log sau này thay đổi
         count(when(col("page") == "Cancellation Confirmation", True)).alias("cancel_count"),
-        # Số session phân biệt
+        # Số session sử dụng ứng dụng
         count("sessionId").alias("total_sessions"),
-        # Số ngày active
+        # Số ngày hoạt động thực tế
         (datediff(
             to_date(lit(max_date)),
             to_date(spark_min("event_time"))
         ) + 1).alias("days_active"),
     )
 
-    # Tỷ lệ bài hát không thích (thumbs_down / total_songs)
+    # Tính tỷ lệ không thích nhạc trên tổng số bài đã nghe
     user_features = user_features.withColumn(
         "dislike_ratio",
         when(col("total_songs") > 0,
              col("thumbs_down") / col("total_songs")).otherwise(0.0)
     ).withColumn(
-        # Sessions trung bình mỗi ngày
+        # Tính số session trung bình mỗi ngày hoạt động
         "avg_sessions_per_day",
         when(col("days_active") > 0,
              col("total_sessions") / col("days_active")).otherwise(0.0)
@@ -106,14 +105,15 @@ def build_user_features(silver_df, spark):
 
 def create_churn_label(user_features):
     """
-    Label: user có bị churn không?
-    Logic: Nếu cancel_count > 0 HOẶC level == 'free' và từng là paid → churn=1
-    (Dùng cancel_count vì eventsim sinh ra sự kiện 'Cancellation Confirmation')
+    Tạo nhãn Churn (0 hoặc 1).
+    Logic chuẩn: User bị coi là Churn nếu họ chủ động bấm Downgrade hoặc Cancel gói.
+    Không được dùng trực tiếp 'level=free' để làm nhãn vì nhiều người dùng chỉ dùng free từ đầu 
+    (chưa bao giờ trả phí thì không gọi là churn được, nếu đưa vào sẽ bị hiện tượng rò rỉ nhãn - label leakage).
     """
     return user_features.withColumn(
         "churn",
         when(
-            (col("cancel_count") > 0) | (col("level") == "free"),
+            (col("cancel_count") > 0) | (col("downgrade_count") > 0),
             lit(1)
         ).otherwise(lit(0))
     )
@@ -121,15 +121,15 @@ def create_churn_label(user_features):
 
 def build_ml_pipeline(feature_cols):
     """
-    Pipeline ML:
-    1. Encode categorical features (gender)
-    2. Assemble thành feature vector
-    3. XGBoost Classifier (Distributed)
+    Thiết lập luồng xử lý (Pipeline) cho học máy:
+    1. Mã hóa giới tính (gender) từ text sang số index.
+    2. Gom tất cả các cột đặc trưng lại thành 1 cột vector duy nhất (features).
+    3. Đưa vào mô hình phân loại XGBoost chạy phân tán.
     """
     gender_indexer = StringIndexer(
         inputCol="gender",
         outputCol="gender_idx",
-        handleInvalid="keep"  # Không crash khi gặp giá trị lạ
+        handleInvalid="keep"  # Để 'keep' để không bị crash nếu lỡ sau này có thêm giới tính khác lạ
     )
 
     assembler = VectorAssembler(
@@ -138,15 +138,14 @@ def build_ml_pipeline(feature_cols):
         handleInvalid="keep"
     )
 
-    # XGBoost Distributed via SparkXGBClassifier
-    # Nếu dùng xgboost4j-spark (recommended):
+    # Ưu tiên dùng XGBoost phân tán nếu môi trường có sẵn thư viện
     try:
         from xgboost.spark import SparkXGBClassifier
         xgb = SparkXGBClassifier(
             features_col="features",
             label_col="churn",
-            num_workers=2,          # Số Spark workers tham gia training
-            use_gpu=False,          # Set True nếu có GPU
+            num_workers=2,          # Phân bổ cho 2 worker chạy song song
+            use_gpu=False,          # Chạy CPU cho lành, đổi thành True nếu worker có gắn card rời
             n_estimators=100,
             max_depth=6,
             learning_rate=0.1,
@@ -157,14 +156,14 @@ def build_ml_pipeline(feature_cols):
             verbosity=1,
         )
     except ImportError:
-        # Fallback: Dùng Spark MLlib GBTClassifier (built-in, fully distributed)
-        print("⚠️  xgboost4j-spark chưa cài, dùng GBTClassifier thay thế (cũng distributed).")
+        # Backup plan: Nếu chưa cài xgboost cho Spark, dùng GBTClassifier có sẵn của Spark MLlib (cũng chạy phân tán tốt)
+        print("⚠️ Không import được xgboost.spark, tự động chuyển sang mô hình dự phòng GBTClassifier.")
         from pyspark.ml.classification import GBTClassifier
         xgb = GBTClassifier(
             featuresCol="features",
             labelCol="churn",
-            maxIter=10,        # Đã giảm từ 100 xuống 10 để tránh OOM
-            maxDepth=4,        # Đã giảm từ 6 xuống 4
+            maxIter=10,        # Giảm số vòng lặp để tránh quá tải bộ nhớ
+            maxDepth=4,        # Giới hạn độ sâu của cây để tối ưu hiệu năng
             stepSize=0.1,
             subsamplingRate=0.8,
             featureSubsetStrategy="0.8",
@@ -192,10 +191,12 @@ def main():
         user_features = build_user_features(silver_df, spark)
         labeled_df = create_churn_label(user_features)
 
-        # Đã loại bỏ các hàm labeled_df.count() ở đây vì nó force Spark phải
-        # compute toàn bộ dataframe nhiều lần, gây OOM cho máy dev 512MB.
+        # CHÚ Ý: Bỏ các lệnh count() trung gian để tối ưu.
+        # Việc gọi count() không cần thiết sẽ ép Spark phải tính toán lại toàn bộ đồ thị, dễ gây lỗi OOM.
 
         # 2. Chuẩn bị features
+        # LƯU Ý: Tuyệt đối không nhét cột 'level' hiện tại vào bộ đặc trưng đầu vào. 
+        # Cột level này tương quan trực tiếp với việc bấm nút hạ cấp (Downgrade) dễ gây rò rỉ thông tin trước cho mô hình (data leakage).
         feature_cols = [
             "gender_idx",           # Encoded
             "total_songs",
@@ -209,24 +210,24 @@ def main():
             "avg_sessions_per_day",
         ]
 
-        # 3. Train/Test split (80/20)
+        # 3. Chia tập dữ liệu thành Train (80%) và Test (20%) để đánh giá khách quan
         train_df, test_df = labeled_df.randomSplit([0.8, 0.2], seed=42)
-        # Đã loại bỏ train_df.count() và test_df.count() để tối ưu RAM
+        # Không gọi count() ở đây luôn để tránh tốn RAM vô ích
 
-        # 4. Build và Train Pipeline (Distributed!)
+        # 4. Tạo pipeline và khởi động quá trình Train phân tán trên Spark cluster
         print("🚀 [Churn Model] Bắt đầu training phân tán trên Spark Cluster...")
         pipeline = build_ml_pipeline(feature_cols)
         model = pipeline.fit(train_df)
         print("✅ Training hoàn tất!")
 
-        # 5. Đánh giá mô hình
+        # 5. Đánh giá chất lượng mô hình trên tập Test
         predictions = model.transform(test_df)
         from pyspark.ml.evaluation import BinaryClassificationEvaluator
         evaluator = BinaryClassificationEvaluator(labelCol="churn", metricName="areaUnderROC")
         auc = evaluator.evaluate(predictions)
         print(f"   📈 AUC Score: {auc:.4f}")
 
-        # 6. Dự đoán tất cả users và lưu vào Gold Layer
+        # 6. Chạy dự báo cho toàn bộ danh sách user rồi lưu kết quả vào Gold Layer
         print(f"💾 [Churn Model] Lưu kết quả dự đoán vào: {gold_path}")
         all_predictions = model.transform(labeled_df)
         all_predictions.select(
@@ -234,7 +235,7 @@ def main():
             "total_songs", "dislike_ratio", "cancel_count"
         ).write.mode("overwrite").parquet(gold_path)
 
-        # 7. Lưu model để dùng lại (inference)
+        # 7. Lưu mô hình (export model) để phục vụ cho các đợt inference sau này
         print(f"💾 [Churn Model] Lưu model vào: {model_path}")
         model.write().overwrite().save(model_path)
 

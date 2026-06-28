@@ -1,13 +1,11 @@
 """
-ML Training Pipeline DAG
-=========================
-Pipeline: Silver → ML Models (ALS Recommendation + Churn Prediction)
-Chạy 1 lần/ngày lúc 2:00 sáng — tác vụ tốn thời gian nhưng không urgent.
+Luồng train các model ML (ALS gợi ý nhạc và XGBoost dự đoán khách rời bỏ - Churn)
+Chạy tự động lúc 2h sáng mỗi ngày — giờ này ít người dùng nên tha hồ train mà không lo nghẽn mạng.
 
-Chiến lược:
-- Đọc dữ liệu Silver ĐÃ SẠCH (do etl_fast_pipeline xử lý liên tục) để train.
-- Kết quả (Gold/recommendations + Gold/churn_predictions) được lưu vào MinIO.
-- Dashboard tự đọc kết quả từ MinIO, không cần real-time.
+Chiến lược thực hiện:
+- Hốt dữ liệu tầng Silver đã được dọn dẹp sạch sẽ (nhờ luồng etl_fast chạy trước đó).
+- Output (file gợi ý và tỉ lệ dự đoán churn) sẽ ném trực tiếp lên MinIO (Gold Layer).
+- Trang Dashboard streamlit sẽ tự động quét file này để hiển thị, không cần cập nhật real-time.
 """
 from airflow import DAG
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
@@ -56,7 +54,8 @@ SPARK_CONF_BASE = {
     ),
 }
 
-# ALS cần tắt AQE để tránh BroadcastExchangeExec → OOM → EOFException
+# Lưu ý quan trọng cho ALS: Phải tắt AQE (Adaptive Query Execution). 
+# Nếu bật, Spark sẽ tự động broadcast các bảng trung gian gây tràn bộ nhớ (OOM) và lỗi EOFException.
 SPARK_CONF_ALS = {
     **SPARK_CONF_BASE,
     'spark.sql.adaptive.enabled': 'false',
@@ -64,7 +63,7 @@ SPARK_CONF_ALS = {
     'spark.sql.autoBroadcastJoinThreshold': '-1',
 }
 
-# Churn dùng chung cấu hình với ALS (tắt AQE) để tránh OOM
+# Model dự đoán Churn cũng dùng chung cấu hình tắt AQE như ALS để giữ an toàn cho bộ nhớ worker.
 SPARK_CONF_CHURN = {
     **SPARK_CONF_ALS
 }
@@ -76,12 +75,12 @@ with DAG(
     schedule='0 2 * * *',  # Chạy lúc 2:00 AM mỗi ngày
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    max_active_runs=1,  # Không cho 2 training jobs chạy đồng thời
+    max_active_runs=1,  # Chỉ cho phép chạy đúng 1 instance tại một thời điểm, tránh việc chạy đè lên nhau gây sập cụm Spark.
     tags=['spark', 'ml', 'training', 'als', 'churn'],
 ) as dag:
 
-    # TASK 1: Train ALS Recommendation Model
-    # Đọc Silver → Học ma trận user×song → Lưu Top-10 recommendations vào Gold
+    # Bước 1: Train model gợi ý nhạc ALS
+    # Đọc dữ liệu Silver -> Phân tích ma trận tương tác User x Song -> Xuất Top 10 bài hát gợi ý lên Gold Layer
     train_recommendation = SparkSubmitOperator(
         task_id='train_als_recommendation',
         application='/opt/airflow/src/jobs/batch/train_recommendation.py',
@@ -91,8 +90,8 @@ with DAG(
         execution_timeout=timedelta(minutes=40),
     )
 
-    # TASK 2: Train Churn Prediction Model
-    # Đọc Silver → Học hành vi nghe nhạc → Dự đoán khả năng churn vào Gold
+    # Bước 2: Train model dự đoán Churn (Khách sắp hủy gói Premium)
+    # Phân tích hành vi tương tác để phát hiện ai chuẩn bị chuyển từ gói PAID sang FREE, lưu kết quả lên Gold
     train_churn = SparkSubmitOperator(
         task_id='train_churn_prediction',
         application='/opt/airflow/src/jobs/batch/churn_prediction.py',
@@ -102,6 +101,6 @@ with DAG(
         execution_timeout=timedelta(minutes=40),
     )
 
-    # ── Flow: ALS xong rồi mới train Churn để không OOM ──
-    # (2 Spark jobs chạy song song = 1024MB RAM → vượt giới hạn 1200MB của worker)
+    # ── Thứ tự: Phải chạy xong ALS rồi mới kích hoạt Churn để tránh quá tải bộ nhớ (OOM) ──
+    # (Tránh chạy song song 2 job Spark đồng thời trên cùng một worker vì sẽ gây tràn RAM của container)
     train_recommendation >> train_churn

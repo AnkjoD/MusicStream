@@ -124,7 +124,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-    mem_limit: 512m
+      start_period: 90s
+    mem_limit: 1536m
     restart: always
 
   airflow-scheduler:
@@ -138,7 +139,7 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
-    mem_limit: 256m
+    mem_limit: 512m
     restart: always
 
   airflow-worker:
@@ -224,21 +225,19 @@ services:
   # spark-worker-2 và spark-worker-3 đã tắt để tiết kiệm RAM
   # Mở lại bằng: docker compose up -d spark-worker-2 spark-worker-3
 
+  # ── MinIO STANDALONE (1 node) — giảm từ 4-node distributed để tiết kiệm RAM ──
   minio:
     image: minio/minio:latest
     container_name: minio
     ports:
-      - "${MINIO_API_PORT}:9000"
-      - "${MINIO_CONSOLE_PORT}:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - ${MINIO_DATA_PATH}/drive1:/data1
-      - ${MINIO_DATA_PATH}/drive2:/data2
-      - ${MINIO_DATA_PATH}/drive3:/data3
-      - ${MINIO_DATA_PATH}/drive4:/data4
-    command: server /data{1...4} --console-address ":9001"
+      - ${MINIO_DATA_PATH}/node1:/data
+    command: server /data --console-address ":9001"
     networks:
       - bigdata-network
     mem_limit: 512m
@@ -248,6 +247,26 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - bigdata-network
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...' &&
+      sleep 5 &&
+      mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-homura_madoka} ${MINIO_ROOT_PASSWORD:-homura123} &&
+      mc mb myminio/bronze-zone --ignore-existing &&
+      mc mb myminio/silver-zone --ignore-existing &&
+      mc mb myminio/gold-zone --ignore-existing &&
+      mc mb myminio/mlflow --ignore-existing &&
+      echo 'MinIO buckets created successfully!'
+      "
 
   dashboard:
     build:
@@ -289,12 +308,61 @@ services:
     environment:
       - KAFKA_BROKER=kafka:9092
       - KAFKA_TOPIC=eventsim
-      - NUM_USERS=200
+      - NUM_USERS=1000
       - GROWTH_RATE=0.0
-      - EVENT_DELAY_MS=200
+      - EVENT_DELAY_MS=100
       - REAL_TIME=true
     mem_limit: 128m
     restart: on-failure
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ${MLFLOW_DATA_PATH:-./data/mlflow}:/mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root s3://gold-zone/mlflow
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - bigdata-network
+    depends_on:
+      - minio
+    mem_limit: 512m
+    restart: always
+
+  # FastAPI Model Serving
+  ml-serving:
+    build:
+      context: ..
+      dockerfile: containers/serving/Dockerfile
+    container_name: ml-serving
+    ports:
+      - "8000:8000"
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    networks:
+      - bigdata-network
+    depends_on:
+      - minio
+      - mlflow
+    mem_limit: 1g
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 networks:
   bigdata-network:

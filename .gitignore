@@ -65,3 +65,23 @@ desktop.ini
 .history/
 *.bak
 *.tmp
+
+# --- Credentials & Secrets ---
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.der
+*secret*.json
+*credential*.json
+*private-key*.json
+service-account*.json
+google-key.json
+aws-key.json
+key.json
+gcp-*.json
+
+# --- Jars ---
+jars/

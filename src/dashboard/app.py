@@ -137,7 +137,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Inject JS: hide Streamlit's grey overlay + "Running..." toast
-st.components.v1.html("""
+st.html("""
 <script>
 (function() {
     const hide = () => {
@@ -154,7 +154,7 @@ st.components.v1.html("""
     obs.observe(document.body, { childList: true, subtree: true, attributes: true });
 })();
 </script>
-""", height=0)
+""")
 
 # ════════════════════════════════════════
 # DATA LOADERS
@@ -163,28 +163,13 @@ st.components.v1.html("""
 STORAGE_OPTS = {
     "key":    os.getenv("MINIO_ACCESS_KEY", "homura_madoka"),
     "secret": os.getenv("MINIO_SECRET_KEY", "homura123"),
+    "use_listings_cache": False,  # Tắt cache của s3fs để thấy file mới realtime
     "client_kwargs": {
         "endpoint_url": os.getenv("MINIO_ENDPOINT", "http://minio:9000")
     }
 }
 
-def _mock_stream():
-    """Fallback data khi MinIO chưa có data."""
-    songs   = ['Blinding Lights','Save Your Tears','Levitating','Stay','Peaches',
-               'Good 4 U','Kiss Me More','Montero','Easy On Me','As It Was']
-    artists = ['The Weeknd','The Weeknd','Dua Lipa','The Kid LAROI','Justin Bieber',
-               'Olivia Rodrigo','Doja Cat','Lil Nas X','Adele','Harry Styles']
-    rows = []
-    for _ in range(400):
-        i = np.random.randint(0, len(songs))
-        rows.append({
-            'song': songs[i], 'artist': artists[i],
-            'timestamp': datetime.now(),
-            'userId': f"user_{np.random.randint(1,500)}",
-            'level': np.random.choice(['free','paid']),
-            'gender': np.random.choice(['M','F']),
-        })
-    return pd.DataFrame(rows)
+
 
 @st.cache_data(ttl=5)
 def load_stream():
@@ -195,11 +180,11 @@ def load_stream():
             storage_options=STORAGE_OPTS
         )
         if df.empty:
-            return _mock_stream(), True
+            return None
         df['timestamp'] = pd.to_datetime(df.get('ts', df.get('ingestion_time')), unit='ms', errors='coerce')
-        return df, False
+        return df
     except:
-        return _mock_stream(), True
+        return None
 
 @st.cache_data(ttl=30)
 def load_song_rankings():
@@ -257,54 +242,53 @@ def get_docker_status():
 
 @st.cache_data(ttl=10)
 def load_perf_metrics():
-    """Thu thập file count, size VÀ timestamps thực tế từ MinIO để tính throughput thật."""
-    import s3fs
+    import boto3
+    from urllib.parse import urlparse
+
     metrics = {
         "bronze": 0, "silver": 0, "gold": 0,
         "bronze_size_mb": 0.0, "silver_size_mb": 0.0, "gold_size_mb": 0.0,
-        # Timestamps thực tế từ MinIO file metadata
         "bronze_oldest": None, "bronze_newest": None,
         "silver_newest": None, "gold_newest": None,
-        # Tính toán throughput thật
         "streaming_events_per_min": 0,
         "bronze_to_silver_lag_min": None,
     }
     try:
-        fs = s3fs.S3FileSystem(
-            key=os.getenv("MINIO_ACCESS_KEY", "homura_madoka"),
-            secret=os.getenv("MINIO_SECRET_KEY", "homura123"),
-            client_kwargs={"endpoint_url": os.getenv("MINIO_ENDPOINT", "http://minio:9000")}
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+            aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+            endpoint_url=os.getenv("MINIO_ENDPOINT", "http://minio:9000")
         )
-        for zone, path in [
-            ("bronze", "bronze-zone/datalake/raw/eventsim"),
-            ("silver", "silver-zone/datalake/silver/eventsim"),
-            ("gold",   "gold-zone/datalake/gold"),
+        paginator = s3.get_paginator('list_objects_v2')
+
+        for zone, bucket, prefix in [
+            ("bronze", "bronze-zone", "datalake/raw/eventsim"),
+            ("silver", "silver-zone", "datalake/silver/eventsim"),
+            ("gold",   "gold-zone",   "datalake/gold"),
         ]:
             try:
-                files = fs.find(path)
-                parquet_files = [f for f in files if f.endswith(".parquet")]
-                if not parquet_files:
-                    continue
-                # File size
-                sizes  = [fs.info(f)["size"] for f in parquet_files]
-                mtimes = [fs.info(f).get("LastModified") or fs.info(f).get("mtime") for f in parquet_files]
-                mtimes = [m for m in mtimes if m is not None]
+                parquet_count = 0
+                total_size = 0
+                mtimes = []
 
-                metrics[zone] = len(parquet_files)
-                metrics[f"{zone}_size_mb"] = round(sum(sizes) / (1024*1024), 2)
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    if "Contents" not in page:
+                        continue
+                    for obj in page["Contents"]:
+                        if obj["Key"].endswith(".parquet"):
+                            parquet_count += 1
+                            total_size += obj.get("Size", 0)
+                            mtimes.append(obj.get("LastModified"))
+
+                metrics[zone] = parquet_count
+                metrics[f"{zone}_size_mb"] = round(total_size / (1024 * 1024), 2)
 
                 if mtimes:
-                    import datetime
-                    # Normalize to datetime
-                    def _to_dt(m):
-                        if hasattr(m, "timestamp"):
-                            return m
-                        return datetime.datetime.fromtimestamp(float(m))
-                    dt_list = [_to_dt(m) for m in mtimes]
-                    metrics[f"{zone}_newest"] = max(dt_list)
+                    metrics[f"{zone}_newest"] = max(mtimes)
                     if zone == "bronze":
-                        metrics["bronze_oldest"] = min(dt_list)
-            except:
+                        metrics["bronze_oldest"] = min(mtimes)
+            except Exception as e:
                 pass
 
         # Tính streaming throughput thật từ bronze timestamps
@@ -387,30 +371,38 @@ with h1:
 with h2:
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("""
-        <div class="pulse-wrap">
+        <div class="pulse-wrap" style="margin-bottom: 0.5rem;">
             <div class="pulse"></div>
             <span style="color:#1DB954;font-weight:700;font-size:0.85rem">LIVE</span>
         </div>
     """, unsafe_allow_html=True)
+    if st.button("🔄 Cập nhật", width='stretch'):
+        st.cache_data.clear()
+        st.rerun()
 
 # ════════════════════════════════════════
 # LOAD DATA
-# ════════════════════════════════════════
-df, is_mock = load_stream()
-
-if is_mock:
-    st.info("⚡ Hiển thị dữ liệu mô phỏng. Pipeline đang chờ Eventsim → Kafka → Spark.", icon="ℹ️")
+df = load_stream()
 
 # ════════════════════════════════════════
 # TOP KPI CARDS
 # ════════════════════════════════════════
 k1, k2, k3, k4 = st.columns(4)
-cards = [
-    (k1, "Total Streams",   f"{len(df):,}",                          "🎧", "Live events"),
-    (k2, "Active Users",    f"{df['userId'].nunique():,}",            "👥", "Unique listeners"),
-    (k3, "Premium Share",   f"{(df['level']=='paid').mean()*100:.1f}%","💎", "Paid subscribers"),
-    (k4, "Unique Tracks",   f"{df['song'].nunique():,}",              "🔍", "Songs playing"),
-]
+if df is not None:
+    cards = [
+        (k1, "Total Streams",   f"{len(df):,}",                          "🎧", "Live events"),
+        (k2, "Active Users",    f"{df['userId'].nunique():,}",            "👥", "Unique listeners"),
+        (k3, "Premium Share",   f"{(df['level']=='paid').mean()*100:.1f}%","💎", "Paid subscribers"),
+        (k4, "Unique Tracks",   f"{df['song'].nunique():,}",              "🔍", "Songs playing"),
+    ]
+else:
+    cards = [
+        (k1, "Total Streams",   "0", "🎧", "Live events"),
+        (k2, "Active Users",    "0", "👥", "Unique listeners"),
+        (k3, "Premium Share",   "0%", "💎", "Paid subscribers"),
+        (k4, "Unique Tracks",   "0", "🔍", "Songs playing"),
+    ]
+
 for col, label, val, icon, sub in cards:
     with col:
         st.markdown(f"""
@@ -435,64 +427,86 @@ tab_stream, tab_ml_churn, tab_ml_rec, tab_gold, tab_perf = st.tabs([
 
 # ── TAB 1: Live Stream ──────────────────
 with tab_stream:
-    c1, c2 = st.columns([2, 1])
+    if df is None:
+        st.markdown("""
+        <div style="text-align:center; padding: 4rem 2rem; background: rgba(255,65,54,0.1); border: 2px dashed #FF4136; border-radius: 16px; margin-top: 1rem;">
+            <h1 style="font-size: 4rem; margin-bottom: 0;">📡</h1>
+            <h2 style="color: #FF4136; font-family: 'Outfit', sans-serif;">Streaming đang tắt hoặc chưa có dữ liệu</h2>
+            <p style="color: #ccc; font-size: 1.1rem;">Vui lòng sang <b>Airflow</b> bật DAG <code>spark_kafka_to_minio_bronze</code> để xem Live Stream.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # ── Hàng 1: Listener Profile & Subscription Mix (cùng 1 dòng) ──
+        r1_c1, r1_c2 = st.columns(2)
+        
+        with r1_c1:
+            st.markdown('<div class="section-title">Listener Profile</div>', unsafe_allow_html=True)
+            g = df['gender'].value_counts()
+            fig_pie = px.pie(values=g.values, names=g.index, hole=0.68,
+                             template='plotly_dark',
+                             color_discrete_sequence=['#1DB954','#FFFFFF'])
+            fig_pie.update_layout(**plotly_transparent(), margin=dict(l=0,r=0,t=10,b=0))
+            st.plotly_chart(fig_pie, width='stretch')
 
-    with c1:
-        st.markdown('<div class="section-title">Real-time Trending Tracks</div>', unsafe_allow_html=True)
+        with r1_c2:
+            st.markdown('<div class="section-title">Subscription Mix</div>', unsafe_allow_html=True)
+            lv = df['level'].value_counts()
+            fig_lv = px.bar(x=lv.index, y=lv.values, template='plotly_dark',
+                            color=lv.index, color_discrete_map={'paid':'#1DB954','free':'#333'})
+            fig_lv.update_layout(**plotly_transparent(), showlegend=False,
+                                  margin=dict(l=0,r=0,t=10,b=0),
+                                  xaxis=dict(title=None), yaxis=dict(title=None, showgrid=False))
+            st.plotly_chart(fig_lv, width='stretch')
+
+        # ── Hàng 2: Trending Tracks (chiếm toàn bộ chiều ngang) ──
+        st.markdown('<div class="section-title" style="margin-top: 1rem;">Real-time Trending Tracks</div>', unsafe_allow_html=True)
         top = df.groupby(['song','artist']).size().reset_index(name='plays') \
                 .sort_values('plays', ascending=False).head(10)
-        fig = px.bar(top, x='plays', y='song', color='plays', orientation='h',
-                     template='plotly_dark',
-                     color_continuous_scale=['#0d2316','#1DB954','#1ed760'],
-                     hover_data={'artist': True})
-        fig.update_layout(**plotly_transparent(),
-                          showlegend=False, coloraxis_showscale=False,
-                          margin=dict(l=0,r=10,t=10,b=0),
-                          yaxis=dict(categoryorder='total ascending', showgrid=False),
-                          xaxis=dict(showgrid=False))
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-
-    with c2:
-        st.markdown('<div class="section-title">Listener Profile</div>', unsafe_allow_html=True)
-        g = df['gender'].value_counts()
-        fig_pie = px.pie(values=g.values, names=g.index, hole=0.68,
+        fig_bar = px.bar(top, x='plays', y='song', color='plays', orientation='h',
                          template='plotly_dark',
-                         color_discrete_sequence=['#1DB954','#FFFFFF'])
-        fig_pie.update_layout(**plotly_transparent(),
-                               margin=dict(l=0,r=0,t=10,b=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
+                         color_continuous_scale=['#0d2316','#1DB954','#1ed760'],
+                         hover_data={'artist': True})
+        fig_bar.update_layout(**plotly_transparent(),
+                              showlegend=False, coloraxis_showscale=False,
+                              height=350, # Đặt chiều cao để không bị quá dài
+                              margin=dict(l=0,r=10,t=10,b=0),
+                              yaxis=dict(categoryorder='total ascending', showgrid=False),
+                              xaxis=dict(showgrid=False))
+        st.plotly_chart(fig_bar, width='stretch', config={'displayModeBar': False})
 
-        st.markdown('<div class="section-title">Subscription Mix</div>', unsafe_allow_html=True)
-        lv = df['level'].value_counts()
-        fig_lv = px.bar(x=lv.index, y=lv.values, template='plotly_dark',
-                        color=lv.index, color_discrete_map={'paid':'#1DB954','free':'#333'})
-        fig_lv.update_layout(**plotly_transparent(), showlegend=False,
+        # ── Hàng 3: Ingestion Velocity (chiếm toàn bộ chiều ngang) ──
+        st.markdown('<div class="section-title" style="margin-top: 2rem;">📈 Ingestion Velocity (per 10 seconds)</div>', unsafe_allow_html=True)
+        df['t_bucket'] = df['timestamp'].dt.floor('10s').dt.strftime('%H:%M:%S')
+        vel = df.groupby('t_bucket').size().reset_index(name='events').tail(30)
+        fig_vel = px.area(vel, x='t_bucket', y='events', template='plotly_dark')
+        fig_vel.update_traces(line_color='#1DB954', fillcolor='rgba(29,185,84,0.12)', line_width=3)
+        fig_vel.update_layout(**plotly_transparent(),
+                              height=250,  # Chiều cao vừa phải
                               margin=dict(l=0,r=0,t=10,b=0),
-                              xaxis=dict(title=None), yaxis=dict(title=None, showgrid=False))
-        st.plotly_chart(fig_lv, use_container_width=True)
-
-    # Ingestion velocity
-    st.markdown('<div class="section-title">📈 Ingestion Velocity (per second)</div>', unsafe_allow_html=True)
-    df['t_bucket'] = df['timestamp'].dt.floor('10s').dt.strftime('%H:%M:%S')
-    vel = df.groupby('t_bucket').size().reset_index(name='events').tail(30)
-    fig_vel = px.area(vel, x='t_bucket', y='events', template='plotly_dark')
-    fig_vel.update_traces(line_color='#1DB954', fillcolor='rgba(29,185,84,0.12)')
-    fig_vel.update_layout(**plotly_transparent(),
-                          margin=dict(l=0,r=0,t=10,b=0),
-                          xaxis=dict(showgrid=False, title=None),
-                          yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', title=None))
-    st.plotly_chart(fig_vel, use_container_width=True)
+                              xaxis=dict(showgrid=False, title=None),
+                              yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', title=None))
+        st.plotly_chart(fig_vel, width='stretch')
 
 # ── TAB 2: Churn Prediction ─────────────
 with tab_ml_churn:
     if churn_df is not None:
         st.markdown('<div class="section-title">⚠️ Users at Risk of Churning (XGBoost/GBT Model)</div>', unsafe_allow_html=True)
 
-        # Extract churn probability
+        # Extract churn probability safely
+        def safe_extract_prob(x):
+            try:
+                # Nếu PyArrow đọc ra dict (Spark Vector serializer)
+                if isinstance(x, dict) and 'values' in x:
+                    return float(x['values'][1])
+                # Nếu là list/numpy array thông thường
+                elif hasattr(x, '__iter__') and len(x) > 1 and not isinstance(x, dict):
+                    return float(x[1])
+                return float(x)
+            except:
+                return 0.0
+
         if 'probability' in churn_df.columns:
-            churn_df['churn_prob'] = churn_df['probability'].apply(
-                lambda x: float(x[1]) if hasattr(x, '__iter__') else float(x)
-            )
+            churn_df['churn_prob'] = churn_df['probability'].apply(safe_extract_prob)
         else:
             churn_df['churn_prob'] = churn_df.get('prediction', 0.5)
 
@@ -527,14 +541,14 @@ with tab_ml_churn:
             fig_hist.add_vline(x=0.7, line_dash="dash", line_color="#FF4136",
                                annotation_text="High Risk Threshold")
             fig_hist.update_layout(**plotly_transparent(), margin=dict(l=0,r=0,t=10,b=0))
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width='stretch')
 
         with c2:
             st.markdown('<div class="section-title">Top 10 At-Risk Users</div>', unsafe_allow_html=True)
             top_risk = churn_df.nlargest(10, 'churn_prob')[['userId','churn_prob','total_songs','cancel_count']] \
                                .rename(columns={'churn_prob':'Risk','total_songs':'Songs','cancel_count':'Cancels'})
             top_risk['Risk'] = top_risk['Risk'].map('{:.1%}'.format)
-            st.dataframe(top_risk, use_container_width=True, hide_index=True)
+            st.dataframe(top_risk, width='stretch', hide_index=True)
 
         # Scatter: songs vs churn risk
         st.markdown('<div class="section-title">Listening Behavior vs Churn Risk</div>', unsafe_allow_html=True)
@@ -548,7 +562,7 @@ with tab_ml_churn:
             opacity=0.7
         )
         fig_sc.update_layout(**plotly_transparent(), margin=dict(l=0,r=0,t=10,b=0))
-        st.plotly_chart(fig_sc, use_container_width=True)
+        st.plotly_chart(fig_sc, width='stretch')
 
     else:
         st.markdown("""
@@ -597,7 +611,7 @@ with tab_ml_rec:
         # Cấu hình UI để cột Recommendation không bị cắt (wrap text)
         st.dataframe(
             display_df[["User", "10 Recommended Songs"]],
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "10 Recommended Songs": st.column_config.TextColumn(
@@ -632,7 +646,7 @@ with tab_gold:
                                    margin=dict(l=0,r=10,t=10,b=0),
                                    yaxis=dict(categoryorder='total ascending', showgrid=False),
                                    xaxis=dict(showgrid=False))
-            st.plotly_chart(fig_gold, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig_gold, width='stretch', config={'displayModeBar': False})
 
         with gc2:
             st.markdown('<div class="section-title">Top Artists</div>', unsafe_allow_html=True)
@@ -642,10 +656,10 @@ with tab_gold:
                              hole=0.5, template='plotly_dark',
                              color_discrete_sequence=px.colors.sequential.Greens_r)
             fig_art.update_layout(**plotly_transparent(), margin=dict(l=0,r=0,t=10,b=0))
-            st.plotly_chart(fig_art, use_container_width=True)
+            st.plotly_chart(fig_art, width='stretch')
 
         st.markdown('<div class="section-title">Full Rankings Table</div>', unsafe_allow_html=True)
-        st.dataframe(gold_df.head(100), use_container_width=True, hide_index=True)
+        st.dataframe(gold_df.head(100), width='stretch', hide_index=True)
 
     else:
         st.markdown("""
@@ -657,10 +671,13 @@ with tab_gold:
 
 # ── Raw Data Inspector ──────────────────
 with st.expander("🔍 Raw Stream Inspector (50 events mới nhất)"):
-    st.dataframe(
-        df.sort_values('timestamp', ascending=False).head(50),
-        use_container_width=True
-    )
+    if df is not None:
+        st.dataframe(
+            df.sort_values('timestamp', ascending=False).head(50),
+            width='stretch'
+        )
+    else:
+        st.write("Không có dữ liệu.")
 
 # ── TAB 5: Hiệu suất Pipeline ───────────
 with tab_perf:
@@ -671,10 +688,10 @@ with tab_perf:
     # ── KPI Row ──
     p1, p2, p3, p4 = st.columns(4)
     kpi_data = [
-        (p1, "🥉 Bronze Files", perf["bronze"], f"{perf['bronze_size_mb']} MB"),
-        (p2, "🥈 Silver Files", perf["silver"], f"{perf['silver_size_mb']} MB"),
-        (p3, "🥇 Gold Files",   perf["gold"],   f"{perf['gold_size_mb']} MB"),
-        (p4, "📡 Events/phút", f"~{len(df)//max(1, int((datetime.now() - df['timestamp'].min()).total_seconds()//60 + 1)):,}" if not is_mock else "~1,000", "Kafka throughput"),
+        (p1, "🥉 Bronze Files", f"{perf['bronze']:,}", f"{perf['bronze_size_mb']} MB"),
+        (p2, "🥈 Silver Files", f"{perf['silver']:,}", f"{perf['silver_size_mb']} MB"),
+        (p3, "🥇 Gold Files",   f"{perf['gold']:,}",   f"{perf['gold_size_mb']} MB"),
+        (p4, "📡 Events/phút", f"~{perf.get('streaming_events_per_min', 0):,}", "Kafka throughput"),
     ]
     for col, label, val, sub in kpi_data:
         with col:
@@ -716,7 +733,7 @@ with tab_perf:
             ]
         }
         comp_df = pd.DataFrame(tech_data)
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        st.dataframe(comp_df, width='stretch', hide_index=True)
 
     with comp_col2:
         # Bar chart speedup
@@ -751,7 +768,7 @@ with tab_perf:
             yaxis_title="Thời gian (phút)",
             title="Thời gian xử lý: Cũ vs Mới",
         )
-        st.plotly_chart(fig_cmp, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_cmp, width='stretch', config={"displayModeBar": False})
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -822,13 +839,10 @@ with tab_perf:
     st.markdown("<br>", unsafe_allow_html=True)
     lnk1, lnk2, lnk3 = st.columns(3)
     with lnk1:
-        st.link_button("🔗 Airflow DAGs", "http://localhost:8888", use_container_width=True)
+        st.link_button("🔗 Airflow DAGs", "http://localhost:8888", width='stretch')
     with lnk2:
-        st.link_button("🔗 Kafka UI", "http://localhost:8081", use_container_width=True)
+        st.link_button("🔗 Kafka UI", "http://localhost:8081", width='stretch')
     with lnk3:
-        st.link_button("🔗 Spark Master", "http://localhost:8082", use_container_width=True)
+        st.link_button("🔗 Spark Master", "http://localhost:8082", width='stretch')
 
-# Auto-refresh mỗi 10 giây
-# Dùng time.sleep nhỏ hơn để giảm tần suất reload, spinner đã bị ẩn bằng CSS
-time.sleep(10)
-st.rerun()
+# Lần lưu này để kích hoạt lại (trigger) Streamlit reload, xóa lỗi TokenError tạm thời do xung đột lúc ghi file.

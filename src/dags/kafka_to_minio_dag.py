@@ -7,7 +7,7 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
-# 1. Cấu hình mặc định cho các Task
+# Cấu hình mặc định áp dụng cho tất cả task trong DAG này
 default_args = {
     'owner': 'homura_madoka',
     'depends_on_past': False,
@@ -17,21 +17,22 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# 2. Khởi tạo DAG
+# Khởi tạo luồng DAG
 with DAG(
     dag_id='spark_kafka_to_minio_bronze',
     default_args=default_args,
     description='Tự động đẩy dữ liệu từ Kafka vào MinIO Bronze Layer (S3-Native)',
-    schedule=None, # Streaming Job chạy liên tục
+    schedule=None, # Set schedule=None vì đây là luồng Streaming chạy liên tục 24/7, không chạy theo lịch cố định
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
     tags=['spark', 'streaming', 'kafka', 'minio', 'bronze'],
 ) as dag:
 
-    # 3. Định nghĩa Task SparkSubmit
-    # QUAN TRỌNG: Không dùng 'packages' vì JARs đã pre-baked trong Spark image.
-    # Khai báo lại sẽ khiến Spark cố download từ Maven → thất bại trong môi trường Docker.
+    # Định nghĩa Task submit job Spark
+    # LƯU Ý LỚN: Tuyệt đối không dùng 'packages' ở đây để tải thêm thư viện.
+    # Vì toàn bộ các file JAR cần thiết đã được cài sẵn (pre-baked) trong image Spark rồi.
+    # Nếu khai báo packages, Spark sẽ cố lên Maven tải lại và sẽ lỗi vì môi trường Docker không có mạng ngoài hoặc tải rất chậm.
     run_spark_job = SparkSubmitOperator(
         task_id='run_kafka_to_minio_streaming',
         application='/opt/airflow/src/jobs/streaming/kafka_to_minio.py',
@@ -44,7 +45,7 @@ with DAG(
             'spark.cores.max': '1',
             'spark.driver.memory': '512m',
             'spark.app.name': 'Airflow_Kafka_To_MinIO_Streaming',
-            # S3A / MinIO
+            # Kết nối MinIO qua giao thức S3A
             'spark.hadoop.fs.s3a.endpoint': MINIO_ENDPOINT,
             'spark.hadoop.fs.s3a.access.key': MINIO_ACCESS_KEY,
             'spark.hadoop.fs.s3a.secret.key': MINIO_SECRET_KEY,
@@ -52,13 +53,13 @@ with DAG(
             'spark.hadoop.fs.s3a.impl': 'org.apache.hadoop.fs.s3a.S3AFileSystem',
             'spark.hadoop.fs.s3a.connection.ssl.enabled': 'false',
             'spark.hadoop.fs.s3a.fast.upload': 'true',
-            # Tắt Maven download (JARs đã có sẵn)
+            # Tránh tải linh tinh từ Maven (do JARs đã được cài sẵn trong image rồi)
             'spark.jars.ivy': '/tmp/.ivy2',
-            # Tắt event log (không có bucket spark-events)
+            # Tắt ghi log sự kiện (vì cụm Spark local không có sẵn bucket spark-events)
             'spark.eventLog.enabled': 'false',
-            # Dùng FileSystem-based checkpoint — tương thích với S3A (không cần rename atomic)
+            # Dùng cơ chế checkpoint dựa trên FileSystem để tương thích tốt với MinIO/S3 (tránh lỗi rename atomic do S3 không hỗ trợ thực sự)
             'spark.sql.streaming.checkpointFileManagerClass': 'org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager',
-            # Suppress WARN vô nghĩa: MetricsConfig + NativeCodeLoader + AdminClientConfig
+            # Tắt mấy cảnh báo vô nghĩa ở console cho đỡ rối mắt (của MetricsConfig, NativeCodeLoader, AdminClientConfig)
             'spark.driver.extraJavaOptions': (
                 '-Dlog4j.logger.org.apache.hadoop.metrics2.impl.MetricsConfig=ERROR '
                 '-Dlog4j.logger.org.apache.hadoop.util.NativeCodeLoader=ERROR '
